@@ -1,4 +1,6 @@
-use crate::{access, config, file_chooser, screencast_dialog, screenshot, subscription};
+use crate::{
+    access, background, config, file_chooser, screencast_dialog, screenshot, subscription,
+};
 use cosmic::iced::core::event::wayland::OutputEvent;
 use cosmic::iced::platform_specific::shell::commands::layer_surface::get_layer_surface;
 use cosmic::iced::runtime::platform_specific::wayland::layer_surface::{
@@ -14,12 +16,7 @@ pub(crate) fn run() -> cosmic::iced::Result {
     let settings = cosmic::app::Settings::default()
         .no_main_window(true)
         .exit_on_close(false);
-    let (config, config_handler) = config::Config::load();
-    let flags = Flags {
-        config,
-        config_handler,
-    };
-    cosmic::app::run::<CosmicPortal>(settings, flags)
+    cosmic::app::run::<CosmicPortal>(settings, ())
 }
 
 // run iced app with no main surface
@@ -29,8 +26,12 @@ pub struct CosmicPortal {
 
     pub config_handler: Option<cosmic_config::Config>,
     pub config: config::Config,
+    /// Broadcasts config changes to the D-Bus interfaces (e.g. Background).
+    pub tx_conf: Option<tokio::sync::watch::Sender<config::Config>>,
 
     pub access_args: Option<access::AccessDialogArgs>,
+
+    pub background_prompts: HashMap<window::Id, background::Args>,
 
     pub file_choosers: HashMap<window::Id, (file_chooser::Args, file_chooser::Dialog)>,
 
@@ -64,6 +65,7 @@ pub enum Msg {
     FileChooser(window::Id, file_chooser::Msg),
     Screenshot(screenshot::Msg),
     Screencast(screencast_dialog::Msg),
+    Background(background::Msg),
     Portal(subscription::Event),
     Output(OutputEvent, WlOutput),
     ConfigSetScreenshot(config::screenshot::Screenshot),
@@ -71,16 +73,10 @@ pub enum Msg {
     ConfigSubUpdate(config::Config),
 }
 
-#[derive(Clone, Debug)]
-pub struct Flags {
-    pub config_handler: Option<cosmic_config::Config>,
-    pub config: config::Config,
-}
-
 impl cosmic::Application for CosmicPortal {
     type Executor = cosmic::executor::Default;
 
-    type Flags = Flags;
+    type Flags = ();
 
     type Message = Msg;
 
@@ -96,10 +92,7 @@ impl cosmic::Application for CosmicPortal {
 
     fn init(
         core: app::Core,
-        Flags {
-            config_handler,
-            config,
-        }: Self::Flags,
+        _flags: Self::Flags,
     ) -> (Self, cosmic::iced::Task<cosmic::Action<Self::Message>>) {
         let wayland_conn = wayland_client::Connection::connect_to_env().unwrap();
         let wayland_helper = crate::wayland::WaylandHelper::new(wayland_conn);
@@ -107,9 +100,11 @@ impl cosmic::Application for CosmicPortal {
         (
             Self {
                 core,
-                config_handler,
-                config,
+                config_handler: None,
+                config: Default::default(),
+                tx_conf: None,
                 access_args: Default::default(),
+                background_prompts: Default::default(),
                 file_choosers: Default::default(),
                 screenshot_args: Default::default(),
                 screencast_args: Default::default(),
@@ -149,6 +144,8 @@ impl cosmic::Application for CosmicPortal {
             screencast_dialog::view(self).map(Msg::Screencast)
         } else if self.outputs.iter().any(|o| o.id == id) {
             screenshot::view(self, id).map(Msg::Screenshot)
+        } else if self.background_prompts.contains_key(&id) {
+            background::view(self, id).map(Msg::Background)
         } else if self.dummy_id == id {
             widget::space::Space::new()
                 .width(Length::Fill)
@@ -180,13 +177,26 @@ impl cosmic::Application for CosmicPortal {
                 subscription::Event::CancelScreencast(handle) => {
                     screencast_dialog::cancel(self, handle).map(cosmic::Action::App)
                 }
+                subscription::Event::Background(args) => {
+                    background::update_args(self, args).map(cosmic::Action::App)
+                }
+                subscription::Event::CancelBackground(id) => {
+                    background::cancel(self, id).map(cosmic::Action::App)
+                }
                 subscription::Event::Config(config) => self.update(Msg::ConfigSubUpdate(config)),
                 subscription::Event::Accent(_)
                 | subscription::Event::IsDark(_)
                 | subscription::Event::HighContrast(_) => cosmic::iced::Task::none(),
-                subscription::Event::Init(tx) => {
+                subscription::Event::Init {
+                    tx,
+                    tx_conf,
+                    handler,
+                } => {
+                    let config = tx_conf.borrow().clone();
                     self.tx = Some(tx);
-                    Task::none()
+                    self.tx_conf = Some(tx_conf);
+                    self.config_handler = handler;
+                    self.update(Msg::ConfigSubUpdate(config))
                 }
                 subscription::Event::NameLost => {
                     log::warn!("'{}' name on bus lost. Exiting.", crate::DBUS_NAME);
@@ -195,6 +205,7 @@ impl cosmic::Application for CosmicPortal {
             },
             Msg::Screenshot(m) => screenshot::update_msg(self, m).map(cosmic::Action::App),
             Msg::Screencast(m) => screencast_dialog::update_msg(self, m).map(cosmic::Action::App),
+            Msg::Background(m) => background::update_msg(self, m).map(cosmic::Action::App),
             Msg::Output(o_event, wl_output) => {
                 match o_event {
                     OutputEvent::Created(Some(info))
@@ -280,7 +291,10 @@ impl cosmic::Application for CosmicPortal {
                 cosmic::iced::Task::none()
             }
             Msg::ConfigSubUpdate(config) => {
-                self.config = config;
+                self.config = config.clone();
+                if let Some(tx_conf) = self.tx_conf.as_ref() {
+                    let _ = tx_conf.send(config);
+                }
                 cosmic::iced::Task::none()
             }
         }
